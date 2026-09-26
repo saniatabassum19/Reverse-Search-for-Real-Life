@@ -1,3 +1,5 @@
+import { retrieveProductContext } from "../../lib/retrieval";
+
 const responseSchema = {
   type: "OBJECT",
   properties: {
@@ -63,6 +65,7 @@ The requested assistance type is provided as an intent:
 - setup: help configure or set up the object
 - learn: explain how to use the object
 - maintain: explain safe routine maintenance or care
+- ask: answer a natural-language question about the identified object.
 
 Your job is to provide practical, cautious, actionable guidance appropriate to the requested intent.
 
@@ -97,7 +100,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: "Object identification is required" });
   }
 
-  const allowedIntents = ["fix", "setup", "learn", "maintain"];
+  const allowedIntents = ["fix", "setup", "learn", "maintain", "ask"];
 
   if (!allowedIntents.includes(intent)) {
     return res.status(400).json({
@@ -118,6 +121,32 @@ export default async function handler(req, res) {
       .json({ error: "Gemini API configuration is missing" });
   }
 
+  let retrieval = { context: "", sources: [] };
+  try {
+    retrieval = await retrieveProductContext({
+      brand: object.brand,
+      product: object.product,
+      model: object.model,
+      category: object.category,
+      intent,
+      question: problem.trim(),
+    });
+  } catch {
+    retrieval = { context: "", sources: [] };
+  }
+
+  const retrievedContext = retrieval.context
+    ? `
+
+RETRIEVED PRODUCT DOCUMENTATION:
+${retrieval.context}
+
+IMPORTANT:
+Use the retrieved documentation as the factual basis for model-specific instructions.
+Do not invent details that are not supported by the retrieved context.
+If the retrieved context does not answer the question, say that the information could not be verified from the available documentation.`
+    : "";
+
   const userPrompt = `
 Requested assistance: ${intent}
 
@@ -130,6 +159,7 @@ Identification confidence: ${object.confidence || "Unknown"}
 
 User's problem:
 ${problem.trim()}
+${retrievedContext}
 `;
 
   const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
@@ -156,7 +186,7 @@ ${problem.trim()}
   try {
     let response;
 
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < 3; attempt++) {
       response = await fetch(geminiUrl, {
         method: "POST",
         headers: {
@@ -174,12 +204,33 @@ ${problem.trim()}
         break;
       }
 
-      if (attempt === 0) {
-        await sleep(1500);
+      if (attempt < 2) {
+        await sleep(1500 * Math.pow(2, attempt));
       }
     }
 
-    const json = await response.json();
+    const responseBody = await response.text();
+    let json;
+    try {
+      json = JSON.parse(responseBody);
+    } catch (error) {
+      if (!response.ok) {
+        console.error("Gemini help request failed", {
+          status: response.status,
+        });
+
+        return res.status(502).json({
+          error: "Gemini help request failed",
+          code: "GEMINI_API_ERROR",
+          details: {
+            status: response.status,
+            body: responseBody || null,
+          },
+        });
+      }
+
+      throw error;
+    }
 
     if (!response.ok) {
       console.error("Gemini help request failed", {
@@ -189,6 +240,10 @@ ${problem.trim()}
       return res.status(502).json({
         error: "Gemini help request failed",
         code: "GEMINI_API_ERROR",
+        details: {
+          status: response.status,
+          body: responseBody || null,
+        },
       });
     }
 
@@ -224,10 +279,17 @@ ${problem.trim()}
       });
     }
 
-    return res.status(200).json(result);
+    return res.status(200).json({ ...result, sources: retrieval.sources });
   } catch (error) {
     console.error("Help API error", {
+      name: error.name,
       message: error.message,
+      causeName: error.cause?.name,
+      causeMessage: error.cause?.message,
+      causeCode: error.cause?.code,
+      causeErrno: error.cause?.errno,
+      causeSyscall: error.cause?.syscall,
+      causeHostname: error.cause?.hostname,
     });
 
     return res.status(502).json({
